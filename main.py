@@ -3,19 +3,123 @@
 import sys
 import os
 import pandas as pd
-from PySide6.QtWidgets import (QApplication, QFileDialog, QHeaderView, QWidget,
-                               QTableWidgetItem, QVBoxLayout, QHBoxLayout, QGridLayout,
-                               QSplitter, QScrollArea, QFrame, QMainWindow, QPushButton,
-                               QComboBox, QTableWidget, QLabel, QLineEdit, QToolButton,
-                               QMessageBox, QGroupBox, QFormLayout)
-from PySide6.QtCore import Qt, Signal, QSize, QRect, QMargins
-from PySide6.QtGui import QIcon, QFont
+import numpy as np
+import time
+import threading
+from datetime import datetime
+from collections import defaultdict
+from functools import partial
 
-from qfluentwidgets import (Dialog, FluentWindow, NavigationItemPosition, SplashScreen,
-                            FluentIcon, setTheme, Theme, SubtitleLabel, PushButton,
-                            ComboBox, TableWidget, MessageBox, InfoBar, InfoBarPosition,
-                            ToolButton, FluentStyleSheet, LineEdit, SmoothScrollArea, FlowLayout, 
-                            Flyout, PrimaryPushButton, PushButton, TogglePushButton)
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
+    QFileDialog, QTableWidget, QTableWidgetItem, QPushButton, QCheckBox, 
+    QComboBox, QScrollArea, QGroupBox, QSplitter, QFrame, QToolButton, 
+    QGridLayout, QSizePolicy, QDialog, QRadioButton, QLineEdit, QStackedWidget,
+    QProgressBar, QFormLayout, QHeaderView, QMessageBox, QGraphicsDropShadowEffect
+)
+from PySide6.QtCore import Qt, QSize, QTimer, Signal, QThread, QObject, QRunnable, QThreadPool, QRect, QMargins, QPoint
+from PySide6.QtGui import QIcon, QFont, QColor, QPalette
+from qfluentwidgets import (
+    FluentIcon, setTheme, Theme, InfoBar, InfoBarPosition, PushButton, 
+    ComboBox, LineEdit, ToolButton, Dialog, MessageBox, PrimaryPushButton,
+    Flyout, FlyoutView, FluentWindow, NavigationItemPosition, SplashScreen,
+    SubtitleLabel, TableWidget, FluentStyleSheet, SmoothScrollArea, FlowLayout,
+    TogglePushButton
+)
+
+
+class ProgressToast(QWidget):
+    """进度提示组件"""
+    
+    def __init__(self, title, content, parent=None):
+        super().__init__(parent.window() if parent else None, Qt.FramelessWindowHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setWindowModality(Qt.NonModal)
+        self.setStyleSheet("""
+            ProgressToast {
+                background-color: white;
+                border: 1px solid #ddd;
+                border-radius: 6px;
+            }
+            QLabel {
+                color: #333;
+            }
+            QProgressBar {
+                text-align: center;
+                border: 1px solid #ddd;
+                border-radius: 3px;
+                background-color: #f0f0f0;
+            }
+            QProgressBar::chunk {
+                background-color: #0078d4;
+                border-radius: 3px;
+            }
+        """)
+        
+        # 主布局
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(10)
+        
+        # 标题
+        self.titleLabel = QLabel(title)
+        self.titleLabel.setStyleSheet("font-weight: bold; font-size: 14px;")
+        layout.addWidget(self.titleLabel)
+        
+        # 内容
+        self.contentLabel = QLabel(content)
+        self.contentLabel.setWordWrap(True)
+        layout.addWidget(self.contentLabel)
+        
+        # 进度条
+        self.progressBar = QProgressBar()
+        self.progressBar.setRange(0, 100)
+        self.progressBar.setValue(0)
+        self.progressBar.setTextVisible(True)
+        self.progressBar.setFixedHeight(8)
+        layout.addWidget(self.progressBar)
+        
+        # 设置阴影效果
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(20)
+        shadow.setColor(QColor(0, 0, 0, 50))
+        shadow.setOffset(0, 2)
+        self.setGraphicsEffect(shadow)
+        
+        # 设置固定大小
+        self.setFixedSize(320, 140)
+        
+        # 在屏幕右下角显示
+        self._positionToast()
+    
+    def _positionToast(self):
+        """将Toast定位到屏幕右下角"""
+        # 使用primaryScreen替代不推荐的desktop方法
+        screen_geometry = QApplication.primaryScreen().geometry()
+        x = screen_geometry.width() - self.width() - 20
+        y = screen_geometry.height() - self.height() - 60
+        self.move(x, y)
+    
+    def setValue(self, value):
+        """设置进度值"""
+        self.progressBar.setValue(value)
+    
+    def setTitle(self, title):
+        """设置标题"""
+        self.titleLabel.setText(title)
+    
+    def setContent(self, content):
+        """设置内容"""
+        self.contentLabel.setText(content)
+    
+    def show(self):
+        """显示Toast"""
+        super().show()
+        # 确保在所有窗口之上
+        self.raise_()
+        self.activateWindow()
+        self._positionToast()  # 重新定位
+
 
 class ExcelMatchWindow(FluentWindow):
     """Excel多条件多sheet查询工具主窗口"""
@@ -23,7 +127,7 @@ class ExcelMatchWindow(FluentWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Excel多条件多sheet查询")
-        self.resize(1600, 800)
+        self.resize(1700, 1000)
         self.setMinimumSize(1200, 700)  # 设置窗口最小尺寸
 
         # 数据存储
@@ -44,9 +148,22 @@ class ExcelMatchWindow(FluentWindow):
         self._initUI()
         self._connectSignalToSlot()
         
+        # 窗口居中显示
+        self.centerOnScreen()
+        
         # 窗口大小变化时重新调整布局
         self.resizeEvent = self.onResize
 
+    def centerOnScreen(self):
+        """将窗口居中显示在屏幕上"""
+        # 获取屏幕几何信息
+        screen_geometry = QApplication.primaryScreen().geometry()
+        # 计算窗口居中位置
+        x = (screen_geometry.width() - self.width()) // 2
+        y = (screen_geometry.height() - self.height()) // 2
+        # 移动窗口到居中位置
+        self.move(x, y)
+    
     def _initUI(self):
         """初始化UI"""
         # 添加导航项
@@ -237,7 +354,7 @@ class ExcelMatchWindow(FluentWindow):
         self.matchFieldsLayout.setContentsMargins(5, 5, 5, 5)
         self.matchFieldsLayout.setHorizontalSpacing(6)
         self.matchFieldsLayout.setVerticalSpacing(2)
-        self.matchFieldsLayout.setAlignment(Qt.AlignTop)  # 内容靠上对齐
+        #self.matchFieldsLayout.setAlignment(Qt.AlignTop)  # 内容靠上对齐
         
         displayFieldsLayout.addWidget(self.matchFieldsContainer, 1)  # 1表示可伸缩
         
@@ -264,7 +381,10 @@ class ExcelMatchWindow(FluentWindow):
         # 结果标题
         resultTitleLayout = QHBoxLayout()
         self.resultLabel = SubtitleLabel("查询结果")
+        self.resultCountLabel = QLabel("")  # 添加结果计数标签
+        self.resultCountLabel.setStyleSheet("color: #0078d4; font-weight: bold;")
         resultTitleLayout.addWidget(self.resultLabel)
+        resultTitleLayout.addWidget(self.resultCountLabel)
         resultTitleLayout.addStretch(1)
         rightLayout.addLayout(resultTitleLayout)
         
@@ -278,7 +398,7 @@ class ExcelMatchWindow(FluentWindow):
         # 添加左右两侧部件到分割器
         self.splitter.addWidget(self.leftWidget)
         self.splitter.addWidget(self.rightWidget)
-        self.splitter.setSizes([600, 800])  # 设置初始大小比例
+        #self.splitter.setSizes([1, 1])  # 设置初始大小比例
         
         # 将分割器添加到主布局
         mainLayout.addWidget(self.splitter, 1)  # 1表示可伸缩
@@ -303,12 +423,14 @@ class ExcelMatchWindow(FluentWindow):
             return
 
         try:
+            # 清空结果计数标签
+            self.resultCountLabel.setText("")
             self.filePathEdit.setText("正在加载...")
             QApplication.processEvents()  # 确保UI更新
 
             # 清空之前的数据
             self.sheets = {}
-            self.clearResultTable()
+            self._clearResultTable()
             
             # 清空已选择的工作表
             self._clearSheetSelections()
@@ -316,36 +438,106 @@ class ExcelMatchWindow(FluentWindow):
             # 清空查询字段和显示字段
             self._clearAllFields()
 
+            # 文件预检查
+            if not os.path.exists(filePath):
+                raise ValueError("找不到指定的Excel文件，请检查文件路径是否正确")
+                
+            if not os.access(filePath, os.R_OK):
+                raise ValueError("无法访问Excel文件，请检查文件权限或是否被其他程序占用")
+                
+            file_size = os.path.getsize(filePath)
+            if file_size == 0:
+                raise ValueError("Excel文件为空，请检查文件内容")
+                
+            if file_size > 50 * 1024 * 1024:  # 大于50MB的文件给出警告
+                result = MessageBox(
+                    "文件较大", 
+                    f"Excel文件大小为{file_size/1024/1024:.1f}MB，加载可能需要较长时间，是否继续？", 
+                    self
+                )
+                result.yesButton.setText("继续加载")
+                result.cancelButton.setText("取消")
+                if not result.exec():
+                    self.filePathEdit.setText("")
+                    return
+
             # 使用pandas读取Excel文件，设置错误处理和类型检测
             try:
                 # 优化: 先获取所有工作表名称
-                excel = pd.ExcelFile(filePath)
+                try:
+                    excel = pd.ExcelFile(filePath)
+                except ImportError as ie:
+                    if "openpyxl" in str(ie):
+                        raise ValueError("缺少openpyxl库，请安装后再试: pip install openpyxl")
+                    elif "xlrd" in str(ie):
+                        raise ValueError("缺少xlrd库，请安装后再试: pip install xlrd")
+                    else:
+                        raise ie
+                except Exception as e:
+                    if "Unsupported format" in str(e) or "Invalid file format" in str(e):
+                        raise ValueError("不支持的Excel文件格式，请确保文件为有效的.xlsx或.xls格式")
+                    elif "Permission denied" in str(e):
+                        raise ValueError("无法访问Excel文件，请检查文件是否被其他程序占用或是否有访问权限")
+                    else:
+                        raise ValueError(f"读取Excel文件时发生错误: {str(e)}")
+                
                 sheet_names = excel.sheet_names
                 
                 if not sheet_names:
                     raise ValueError("Excel文件中没有工作表")
                 
-                # 显示加载进度
-                InfoBar.info(
-                    title="正在加载",
-                    content=f"发现 {len(sheet_names)} 个工作表，开始读取数据...",
-                    parent=self,
-                    position=InfoBarPosition.TOP,
-                    duration=2000
-                )
+                # 创建加载进度提示
+                progress_toast = ProgressToast("Excel加载中", f"发现 {len(sheet_names)} 个工作表", self)
+                progress_toast.show()
                 QApplication.processEvents()  # 更新UI
                 
+                # 记录加载过程中的错误，但不立即终止
+                load_errors = []
+                
                 # 逐个读取工作表
-                for sheet_name in sheet_names:
+                for idx, sheet_name in enumerate(sheet_names):
                     try:
+                        # 更新进度
+                        progress = int((idx + 1) / len(sheet_names) * 100)
+                        progress_toast.setValue(progress)
+                        progress_toast.setContent(f"正在加载工作表: {sheet_name} ({idx+1}/{len(sheet_names)})")
+                        QApplication.processEvents()  # 更新UI
+                        
                         # 尝试读取工作表，设置更多参数以提高兼容性
-                        df = pd.read_excel(
-                            filePath, 
-                            sheet_name=sheet_name,
-                            engine='openpyxl',  # 使用openpyxl引擎提高兼容性
-                            na_values=['NA', 'N/A', ''],  # 处理多种空值表示
-                            keep_default_na=True
-                        )
+                        try:
+                            # 先尝试使用pandas新版参数
+                            df = pd.read_excel(
+                                filePath, 
+                                sheet_name=sheet_name,
+                                engine='openpyxl',  # 使用openpyxl引擎提高兼容性
+                                na_values=['NA', 'N/A', ''],  # 处理多种空值表示
+                                keep_default_na=True,
+                                on_bad_lines='skip'  # pandas 1.3.0+支持此参数
+                            )
+                        except TypeError as type_err:
+                            # 如果是参数错误（老版本pandas不支持on_bad_lines参数）
+                            if 'on_bad_lines' in str(type_err):
+                                # 回退到不使用该参数
+                                df = pd.read_excel(
+                                    filePath, 
+                                    sheet_name=sheet_name,
+                                    engine='openpyxl',
+                                    na_values=['NA', 'N/A', ''],
+                                    keep_default_na=True
+                                )
+                            else:
+                                # 其他类型错误，继续抛出
+                                raise
+                        
+                        # 检查是否为空数据
+                        if df.empty:
+                            load_errors.append(f"工作表 '{sheet_name}' 无有效数据")
+                            continue
+                            
+                        # 检查是否超出行列限制
+                        if len(df) > 1000000:
+                            load_errors.append(f"工作表 '{sheet_name}' 行数过多，仅读取前1000000行")
+                            df = df.iloc[:1000000]
                         
                         # 执行基本数据清洗
                         df = df.replace({pd.NA: None})  # 统一空值表示
@@ -354,82 +546,105 @@ class ExcelMatchWindow(FluentWindow):
                         self.sheets[sheet_name] = df
                     except Exception as sheet_error:
                         # 如果单个工作表加载失败，记录错误但继续处理其他工作表
+                        error_message = f"工作表 '{sheet_name}' 加载失败: {str(sheet_error)}"
+                        load_errors.append(error_message)
+                        print(error_message)
+                        continue
+                
+                # 关闭进度提示
+                progress_toast.close()
+                
+                # 检查是否成功加载了任何工作表
+                if not self.sheets:
+                    if load_errors:
+                        error_msg = "\n".join(load_errors[:5])
+                        if len(load_errors) > 5:
+                            error_msg += f"\n以及其他 {len(load_errors) - 5} 个错误..."
+                        raise ValueError(f"所有工作表加载失败:\n{error_msg}")
+                    else:
+                        raise ValueError("所有工作表加载失败，未知原因")
+                
+                # 更新界面显示工作表
+                sheet_names = list(self.sheets.keys())
+                
+                # 添加所有工作表按钮
+                if sheet_names:
+                    # 创建所有工作表的TogglePushButton
+                    for sheet_name in sheet_names:
+                        self._addSheetToggleButton(sheet_name)
+                    
+                    # 自动添加一个查询条件和一个显示字段
+                    self._addQueryField()
+                    self._addMatchField()
+                    
+                    # 如果有加载错误，显示警告但继续操作
+                    if load_errors:
+                        error_msg = "\n".join(load_errors[:3])
+                        if len(load_errors) > 3:
+                            error_msg += f"\n以及其他 {len(load_errors) - 3} 个错误..."
+                        
                         InfoBar.warning(
-                            title="工作表加载警告",
-                            content=f"工作表 '{sheet_name}' 加载失败: {str(sheet_error)}",
+                            title="部分加载警告",
+                            content=f"成功加载 {len(sheet_names)}/{len(sheet_names)+len(load_errors)} 个工作表",
                             parent=self,
                             position=InfoBarPosition.TOP,
                             duration=3000
                         )
-                        continue
+                else:
+                    # 这种情况不应该发生，因为前面已经检查过
+                    raise ValueError("没有找到有效的工作表")
                 
-                # 检查是否成功加载了任何工作表
-                if not self.sheets:
-                    raise ValueError("所有工作表加载失败")
+                # 更新字段按钮状态
+                self._updateExecuteButtonState()
+
+                # 更新文件路径显示
+                self.filePathEdit.setText(filePath)
+
+                # 自动检测并选择合适的处理模式
+                self._autoDetectAndSetProcessingMode(sheet_names)
+
+                # 显示成功消息
+                InfoBar.success(
+                    title="成功",
+                    content=f"已加载Excel文件: {os.path.basename(filePath)} ({len(sheet_names)} 个工作表)",
+                    parent=self,
+                    position=InfoBarPosition.TOP_RIGHT,
+                    duration=3000
+                )
                 
-            except ImportError:
+            except ImportError as ie:
                 # 如果openpyxl不可用，回退到xlrd
-                try:
-                    self.sheets = pd.read_excel(filePath, sheet_name=None, engine='xlrd')
-                except Exception as e:
-                    raise ValueError(f"Excel文件读取失败: {str(e)}")
+                if "openpyxl" in str(ie).lower():
+                    try:
+                        self.sheets = pd.read_excel(filePath, sheet_name=None, engine='xlrd')
+                        # 处理成功加载的情况
+                        sheet_names = list(self.sheets.keys())
+                        # ...其余代码与上面相同...
+                    except Exception as e:
+                        raise ValueError(f"尝试使用xlrd引擎读取Excel文件失败: {str(e)}")
+                else:
+                    raise ValueError(f"缺少必要的库: {str(ie)}")
             except Exception as e:
+                # 这里捕获的是read_excel异常
                 raise ValueError(f"Excel文件读取失败: {str(e)}")
             
-            # 更新界面显示工作表
-            sheet_names = list(self.sheets.keys())
-            
-            # 添加所有工作表按钮
-            if sheet_names:
-                # 创建所有工作表的TogglePushButton
-                for sheet_name in sheet_names:
-                    self._addSheetToggleButton(sheet_name)
-                
-                # 自动添加一个查询条件和一个显示字段
-                self._addQueryField()
-                self._addMatchField()
-            else:
-                # 这种情况不应该发生，因为前面已经检查过
-                raise ValueError("没有找到有效的工作表")
-            
-            # 更新字段按钮状态
-            self._updateExecuteButtonState()
-
-            # 更新文件路径显示
-            self.filePathEdit.setText(filePath)
-
-            # 显示成功消息
-            InfoBar.success(
-                title="成功",
-                content=f"已加载Excel文件: {os.path.basename(filePath)} ({len(sheet_names)} 个工作表)",
-                parent=self,
-                position=InfoBarPosition.TOP,
-                duration=3000
-            )
-
-        except Exception as e:
+        except ValueError as e:
             # 清空文件路径
             self.filePathEdit.setText("")
             
             # 显示详细的错误信息
-            error_message = f"加载Excel文件时出错: {str(e)}"
-            
-            # 提供更友好的错误提示
-            if "No such file" in str(e):
-                error_message = "找不到指定的Excel文件，请检查文件路径是否正确"
-            elif "openpyxl" in str(e) and "not installed" in str(e):
-                error_message = "缺少openpyxl库，请安装后再试: pip install openpyxl"
-            elif "xlrd" in str(e) and "not installed" in str(e):
-                error_message = "缺少xlrd库，请安装后再试: pip install xlrd"
-            elif "Unsupported format" in str(e) or "Invalid file format" in str(e):
-                error_message = "不支持的Excel文件格式，请确保文件为有效的.xlsx或.xls格式"
-            elif "Permission denied" in str(e):
-                error_message = "无法访问Excel文件，请检查文件是否被其他程序占用或是否有访问权限"
+            error_message = str(e)
             
             # 显示错误对话框
             MessageBox("错误", error_message, self).exec()
             
             # 打印异常堆栈跟踪，方便调试
+            import traceback
+            traceback.print_exc()
+        except Exception as e:
+            # 处理其他所有异常
+            self.filePathEdit.setText("")
+            MessageBox("未知错误", f"加载Excel文件时发生未知错误: {str(e)}", self).exec()
             import traceback
             traceback.print_exc()
 
@@ -464,9 +679,89 @@ class ExcelMatchWindow(FluentWindow):
     
     def _onSheetToggled(self, sheet_name, checked):
         """工作表选择状态改变时的处理"""
+        # 清空结果计数标签
+        self.resultCountLabel.setText("")
+        
+        # 更新所有现有查询字段的下拉选项
+        self._updateAllQueryFieldsOptions()
+        
+        # 更新所有现有显示字段的下拉选项
+        self._updateAllMatchFieldsOptions()
+        
         # 更新执行按钮状态
         self._updateExecuteButtonState()
+    
+    def _updateAllQueryFieldsOptions(self):
+        """
+        更新所有查询字段的下拉选项
         
+        当用户改变工作表选择或切换处理模式时，该方法会根据当前的
+        选中工作表和处理模式动态更新所有查询字段的可选列。
+        同时会尝试保留原先的选择，如果原先选择的列仍然可用。
+        """
+        if not self.query_fields:
+            return
+            
+        # 获取最新的列选项
+        columns = self._getAllQueryColumns()
+        if not columns:
+            return
+            
+        # 更新每个查询字段的下拉列表
+        for field in self.query_fields:
+            if isinstance(field, dict) and 'comboBox' in field:
+                # 保存当前选择的列
+                current_column = field['comboBox'].currentText()
+                
+                # 更新列表选项
+                field['comboBox'].clear()
+                field['comboBox'].addItems(columns)
+                
+                # 尝试恢复原来的选择
+                index = field['comboBox'].findText(current_column)
+                if index >= 0:
+                    field['comboBox'].setCurrentIndex(index)
+                else:
+                    # 如果原来的列不再可用，选择第一个列
+                    field['comboBox'].setCurrentIndex(0)
+                    
+                # 手动触发列变更事件以更新操作符
+                if 'updateOperators' in field and callable(field['updateOperators']):
+                    field['updateOperators']()
+
+    def _updateAllMatchFieldsOptions(self):
+        """
+        更新所有显示字段的下拉选项
+        
+        当用户改变工作表选择或切换处理模式时，该方法会根据当前的
+        选中工作表和处理模式动态更新所有显示字段的可选列。
+        同时会尝试保留原先的选择，如果原先选择的列仍然可用。
+        """
+        if not self.match_fields:
+            return
+            
+        # 获取最新的列选项
+        columns = self._getAllMatchColumns()
+        if not columns:
+            return
+            
+        # 更新每个显示字段的下拉列表
+        for combo, _ in self.match_fields:
+            # 保存当前选择的列
+            current_column = combo.currentText()
+            
+            # 更新列表选项
+            combo.clear()
+            combo.addItems(columns)
+            
+            # 尝试恢复原来的选择
+            index = combo.findText(current_column)
+            if index >= 0:
+                combo.setCurrentIndex(index)
+            else:
+                # 如果原来的列不再可用，选择第一个列
+                combo.setCurrentIndex(0)
+    
     def _clearSheetSelections(self):
         """清空所有工作表选择"""
         # 清空已选择的工作表
@@ -486,10 +781,9 @@ class ExcelMatchWindow(FluentWindow):
     def _clearQueryFields(self):
         """清空所有查询字段"""
         # 清空查询字段
-        for field_tuple in self.query_fields:
-            # 字段元组现在可能是(列选择框, 操作符选择框, 值输入框, 逻辑选择框)
-            if len(field_tuple) > 0 and field_tuple[0].parentWidget():
-                field_tuple[0].parentWidget().deleteLater()
+        for field in self.query_fields:
+            if isinstance(field, dict) and 'comboBox' in field and field['comboBox'].parentWidget():
+                field['comboBox'].parentWidget().deleteLater()
         self.query_fields = []
         
     def _clearMatchFields(self):
@@ -524,20 +818,46 @@ class ExcelMatchWindow(FluentWindow):
             
             # 检查是否有查询条件
             has_query_conditions = False
-            for field_tuple in self.query_fields:
-                if len(field_tuple) >= 3 and field_tuple[2].text().strip():
+            for field in self.query_fields:
+                if isinstance(field, dict) and 'valueEdit' in field and field['valueEdit'].text().strip():
                     has_query_conditions = True
                     break
                     
             if not has_query_conditions:
-                # 告诉用户没有设置查询条件，但仍会执行
-                InfoBar.info(
-                    title="查询提示",
-                    content="未设置查询条件，将返回所有数据",
-                    parent=self,
-                    position=InfoBarPosition.TOP,
-                    duration=3000
+                # 使用FluentUI中的FlyoutView创建提示
+                flyout_view = FlyoutView(
+                    title='查询确认',
+                    content="未设置查询条件，将返回所有数据。是否继续？",
+                    isClosable=True
                 )
+                
+                # 创建按钮容器部件
+                btn_widget = QWidget()
+                btn_layout = QHBoxLayout(btn_widget)
+                btn_layout.setContentsMargins(10, 5, 10, 10)
+                
+                # 添加按钮
+                continueBtn = PrimaryPushButton('继续查询')
+                cancelBtn = PushButton('取消')
+                continueBtn.setFixedWidth(90)
+                cancelBtn.setFixedWidth(70)
+                
+                btn_layout.addWidget(continueBtn)
+                btn_layout.addWidget(cancelBtn)
+                btn_layout.addStretch(1)
+                
+                # 将按钮部件添加到视图
+                flyout_view.addWidget(btn_widget)
+                
+                # 显示弹出窗口
+                flyout_widget = Flyout.make(flyout_view, self.executeQueryButton, self)
+                
+                # 连接信号
+                continueBtn.clicked.connect(lambda: self._continueQueryExecution(flyout_widget, processing_mode, selected_sheet_names))
+                cancelBtn.clicked.connect(flyout_widget.close)
+                flyout_view.closed.connect(flyout_widget.close)
+                
+                return  # 等待用户选择是否继续
             
             # 执行对应模式的查询
             if processing_mode == "堆叠":
@@ -553,7 +873,7 @@ class ExcelMatchWindow(FluentWindow):
                         title="模式调整",
                         content="合并模式需要至少两个工作表，已自动切换为堆叠模式",
                         parent=self,
-                        position=InfoBarPosition.TOP,
+                        position=InfoBarPosition.TOP_RIGHT,
                         duration=3000
                     )
                 # 执行堆叠模式
@@ -561,13 +881,13 @@ class ExcelMatchWindow(FluentWindow):
             
         except KeyError as e:
             MessageBox("查询错误", f"列名错误: {str(e)}", self).exec()
-            self.clearResultTable()
+            self._clearResultTable()
         except ValueError as e:
             MessageBox("查询错误", f"值错误: {str(e)}", self).exec()
-            self.clearResultTable()
+            self._clearResultTable()
         except Exception as e:
             MessageBox("错误", f"执行查询时发生意外错误: {str(e)}", self).exec()
-            self.clearResultTable()
+            self._clearResultTable()
             
     def _executeStackMode(self, selected_sheet_names):
         """执行垂直堆叠模式，适用于工作表有相似结构的情况"""
@@ -609,7 +929,7 @@ class ExcelMatchWindow(FluentWindow):
                 "未找到匹配记录，请检查查询条件或选择其他工作表。", 
                 self
             ).exec()
-            self.clearResultTable()
+            self._clearResultTable()
             return
             
         # 垂直堆叠所有数据（类似VSTACK功能）
@@ -647,7 +967,7 @@ class ExcelMatchWindow(FluentWindow):
                     "未找到有效工作表数据，请检查所选工作表。", 
                     self
                 ).exec()
-                self.clearResultTable()
+                self._clearResultTable()
                 return
             
             # 保存所有列信息，用于后续更新查询和显示字段
@@ -664,10 +984,10 @@ class ExcelMatchWindow(FluentWindow):
             if not common_columns:
                 # 如果没有共同列，提示用户并回退到堆叠模式
                 InfoBar.warning(
-                    title="无法执行合并",
-                    content="所选工作表没有共同列可供合并，将使用堆叠模式",
+                    title="处理模式调整",
+                    content="工作表之间没有共同列，无法执行合并，将使用堆叠模式",
                     parent=self,
-                    position=InfoBarPosition.TOP,
+                    position=InfoBarPosition.TOP_RIGHT,
                     duration=3000
                 )
                 self._executeStackMode(selected_sheet_names)
@@ -680,22 +1000,22 @@ class ExcelMatchWindow(FluentWindow):
                 merge_key = self._showMergeKeySelectionDialog(common_columns)
                 if not merge_key:  # 用户取消选择
                     InfoBar.warning(
-                        title="合并取消",
-                        content="未选择合并键，将使用堆叠模式",
+                        title="处理模式调整",
+                        content="未选择关联字段，将使用堆叠模式处理数据",
                         parent=self,
-                        position=InfoBarPosition.TOP,
+                        position=InfoBarPosition.TOP_RIGHT,
                         duration=3000
                     )
                     self._executeStackMode(selected_sheet_names)
                     return
             else:
-                # 只有一个共同列，直接使用
+                # 只有一个共同列，直接使用，但不显示InfoBar
                 merge_key = common_columns[0]
                 InfoBar.info(
                     title="合并信息",
                     content=f"使用唯一共同列 '{merge_key}' 作为合并键",
                     parent=self,
-                    position=InfoBarPosition.TOP,
+                    position=InfoBarPosition.TOP_RIGHT,
                     duration=3000
                 )
                 
@@ -708,7 +1028,7 @@ class ExcelMatchWindow(FluentWindow):
                     title="合并情况",
                     content="没有设置查询条件，将合并所有数据",
                     parent=self,
-                    position=InfoBarPosition.TOP,
+                    position=InfoBarPosition.TOP_RIGHT,
                     duration=3000
                 )
                 merged_df = self._mergeAllSheets(sheet_dfs, merge_key)
@@ -719,7 +1039,7 @@ class ExcelMatchWindow(FluentWindow):
                         "合并后无有效数据，请检查工作表数据或合并键。", 
                         self
                     ).exec()
-                    self.clearResultTable()
+                    self._clearResultTable()
                     return
                     
                 merged_df['数据来源'] = '合并数据'
@@ -742,25 +1062,34 @@ class ExcelMatchWindow(FluentWindow):
                         # 检查是否有条件不满足
                         pre_filtered_df = df.copy()
                         for field in sheet_query_fields:
-                            if len(field) >= 3 and field[2].text().strip():
-                                column = field[0].currentText()
-                                operator = field[1].currentText()
-                                value = field[2].text().strip()
+                            if isinstance(field, dict) and 'valueEdit' in field and field['valueEdit'].text().strip():
+                                column = field['comboBox'].currentText()
+                                operator = field['operatorCombo'].currentText()
+                                value = field['valueEdit'].text().strip()
+                                
+                                print(f"检查条件预过滤 - 工作表: {sheet_name}, 条件: {column} {operator} {value}")
                                 
                                 # 应用单个条件检查
                                 temp_mask = self._applySingleCondition(pre_filtered_df, column, operator, value)
+                                matching_count = temp_mask.sum() if isinstance(temp_mask, pd.Series) else 0
+                                print(f"预过滤匹配结果: {matching_count} 行数据")
+                                
                                 if not temp_mask.any():
                                     all_condition_errors.append(f"工作表 '{sheet_name}' 的条件 '{column} {operator} {value}' 没有匹配数据")
                         
                         # 如果没有错误，才应用完整的查询条件
                         if not all_condition_errors:
+                            print(f"应用完整查询条件 - 工作表: {sheet_name}, 字段数量: {len(sheet_query_fields)}")
                             filtered_df = self._applyQueryConditions(df, sheet_query_fields)
                             
                             # 如果过滤后有数据，添加标识并保存
                             if not filtered_df.empty:
+                                print(f"过滤后数据行数: {len(filtered_df)}")
                                 filtered_df = filtered_df.copy()
                                 filtered_df.loc[:, f'{sheet_name}_数据来源'] = True
                                 filtered_dfs[sheet_name] = filtered_df
+                            else:
+                                print(f"过滤后无数据 - 工作表: {sheet_name}")
                     except Exception as e:
                         all_condition_errors.append(f"工作表 '{sheet_name}' 查询出错: {str(e)}")
             
@@ -772,7 +1101,7 @@ class ExcelMatchWindow(FluentWindow):
                 message += "\n请检查查询条件。"
                 
                 MessageBox("查询结果", message, self).exec()
-                self.clearResultTable()
+                self._clearResultTable()
                 return
             
             # 检查是否有任何工作表有查询条件
@@ -789,7 +1118,7 @@ class ExcelMatchWindow(FluentWindow):
                         "没有满足条件的数据，请检查查询条件或选择其他工作表。", 
                         self
                     ).exec()
-                    self.clearResultTable()
+                    self._clearResultTable()
                     return
                 
                 # 开始合并满足条件的工作表
@@ -808,7 +1137,7 @@ class ExcelMatchWindow(FluentWindow):
                     "合并后无满足条件的数据，请检查查询条件或选择其他工作表。", 
                     self
                 ).exec()
-                self.clearResultTable()
+                self._clearResultTable()
                 return
                 
             # 创建统一的数据来源列
@@ -828,7 +1157,7 @@ class ExcelMatchWindow(FluentWindow):
                             "合并后应用所有条件筛选，无匹配记录。请检查查询条件是否过于严格。", 
                             self
                         ).exec()
-                        self.clearResultTable()
+                        self._clearResultTable()
                         return
                     
                     # 使用最终过滤后的数据
@@ -839,7 +1168,7 @@ class ExcelMatchWindow(FluentWindow):
                         f"应用最终查询条件时出错: {str(e)}\n请检查查询条件。", 
                         self
                     ).exec()
-                    self.clearResultTable()
+                    self._clearResultTable()
                     return
             
             # 筛选显示列
@@ -852,111 +1181,68 @@ class ExcelMatchWindow(FluentWindow):
                 f"合并查询出错: {str(e)}\n请检查查询条件和工作表数据。", 
                 self
             ).exec()
-            self.clearResultTable()
+            self._clearResultTable()
 
     def _applySingleCondition(self, df, column, operator, value):
-        """应用单个查询条件并返回掩码"""
-        import warnings
-        warnings.filterwarnings("ignore", category=UserWarning, module="pandas.core.tools.datetimes")
-        
-        date_formats = [
-            '%Y-%m-%d', '%d/%m/%Y', '%m/%d/%Y', 
-            '%Y/%m/%d', '%Y-%m-%d %H:%M:%S',
-            '%d-%m-%Y', '%m-%d-%Y'
-        ]
-        
-        # 如果列不存在，返回全False掩码
+        """根据单个条件过滤数据"""
         if column not in df.columns:
             return pd.Series([False] * len(df))
-            
-        # 检测日期列
+        
+        # 检查列是否为日期类型
         is_datetime_column = False
-        date_col = None
-        
         try:
-            if pd.api.types.is_datetime64_any_dtype(df[column].dtype):
-                is_datetime_column = True
-                date_col = df[column]
-            else:
-                # 尝试转换第一个非空值来检测是否可能是日期字符串
-                sample = df[column].dropna().iloc[0] if not df[column].dropna().empty else None
-                if sample and isinstance(sample, str):
-                    try:
-                        # 尝试使用常见日期格式进行解析
-                        for date_format in date_formats:
-                            try:
-                                date_col = pd.to_datetime(df[column], format=date_format, errors='coerce')
-                                # 如果大部分值不是NaT，说明找到了正确的格式
-                                if date_col.notna().sum() > 0.5 * len(date_col):
-                                    is_datetime_column = True
-                                    break
-                            except:
-                                continue
-                                
-                        # 如果所有尝试失败，最后尝试自动推断
-                        if not is_datetime_column:
-                            with warnings.catch_warnings():
-                                warnings.simplefilter("ignore")
-                                date_col = pd.to_datetime(df[column], errors='coerce')
-                                # 如果转换成功（不全是NaT），则视为日期列
-                                if not date_col.isna().all() and date_col.notna().sum() > 0.5 * len(date_col):
-                                    is_datetime_column = True
-                    except:
-                        pass
+            date_col = pd.to_datetime(df[column])
+            is_datetime_column = True
         except:
-            pass
-        
-        # 根据操作符和字段类型构建查询条件
+            is_datetime_column = False
+            
+        # 可能的日期格式
+        date_formats = ["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d", "%Y.%m.%d", "%d.%m.%Y", "%m.%d.%Y"]
+            
         if operator == "包含":
-            if is_datetime_column:
-                # 对日期列进行字符串包含查询
-                str_col = df[column].astype(str)
-                return str_col.str.contains(value, case=False, na=False)
-            elif pd.api.types.is_numeric_dtype(df[column]):
-                # 数值列转字符串后包含查询
-                return df[column].astype(str).str.contains(value, case=False, na=False)
+            # 空值处理
+            if pd.isna(df[column]).any():
+                # 将非空值转为字符串进行包含判断，空值保持为False
+                mask = df[column].notna()
+                result = pd.Series([False] * len(df))
+                result[mask] = df.loc[mask, column].astype(str).str.contains(str(value), case=False, na=False)
+                return result
             else:
-                # 字符串列直接包含查询
-                return df[column].astype(str).str.contains(value, case=False, na=False)
-        
+                return df[column].astype(str).str.contains(str(value), case=False, na=False)
+                
         elif operator == "不包含":
-            if is_datetime_column:
-                str_col = df[column].astype(str)
-                return ~str_col.str.contains(value, case=False, na=False)
-            elif pd.api.types.is_numeric_dtype(df[column]):
-                return ~df[column].astype(str).str.contains(value, case=False, na=False)
+            # 空值处理
+            if pd.isna(df[column]).any():
+                # 将非空值转为字符串进行不包含判断，空值保持为False
+                mask = df[column].notna()
+                result = pd.Series([False] * len(df))
+                result[mask] = ~df.loc[mask, column].astype(str).str.contains(str(value), case=False, na=False)
+                return result
             else:
-                return ~df[column].astype(str).str.contains(value, case=False, na=False)
-        
+                return ~df[column].astype(str).str.contains(str(value), case=False, na=False)
+                
         elif operator == "等于":
             if is_datetime_column:
                 try:
-                    # 尝试使用已知的日期格式解析查询值
-                    query_date = None
                     for date_format in date_formats:
                         try:
                             query_date = pd.to_datetime(value, format=date_format)
                             break
                         except:
                             continue
-                            
-                    # 如果格式化失败，尝试自动推断
-                    if query_date is None:
+                    if 'query_date' not in locals():
                         query_date = pd.to_datetime(value)
-                        
-                    return date_col.dt.date == query_date.date()
+                    return date_col == query_date
                 except:
                     return df[column].astype(str) == value
-            elif pd.api.types.is_numeric_dtype(df[column]):
-                try:
-                    return df[column] == float(value)
-                except ValueError:
-                    return df[column].astype(str) == value
             else:
-                return df[column].astype(str) == value
-        
-        # ... [为其他操作符添加相似的逻辑]
-        # 基本操作符的逻辑
+                try:
+                    # 尝试数值比较
+                    return df[column] == float(value)
+                except:
+                    # 回退到字符串比较
+                    return df[column].astype(str) == value
+                    
         elif operator == "大于":
             if is_datetime_column:
                 try:
@@ -997,6 +1283,50 @@ class ExcelMatchWindow(FluentWindow):
                 except:
                     return df[column].astype(str) < value
                     
+        elif operator == "介于":
+            # 解析范围值（格式：最小值,最大值）
+            try:
+                min_val, max_val = value.split(',', 1)
+                min_val = min_val.strip()
+                max_val = max_val.strip()
+                
+                if is_datetime_column:
+                    try:
+                        # 尝试不同的日期格式
+                        min_date = None
+                        max_date = None
+                        
+                        for date_format in date_formats:
+                            try:
+                                if not min_date:
+                                    min_date = pd.to_datetime(min_val, format=date_format)
+                                if not max_date:
+                                    max_date = pd.to_datetime(max_val, format=date_format)
+                                if min_date and max_date:
+                                    break
+                            except:
+                                continue
+                                
+                        if not min_date:
+                            min_date = pd.to_datetime(min_val)
+                        if not max_date:
+                            max_date = pd.to_datetime(max_val)
+                            
+                        return (date_col >= min_date) & (date_col <= max_date)
+                    except:
+                        return pd.Series([False] * len(df))
+                else:
+                    try:
+                        # 尝试数值比较
+                        min_num = float(min_val)
+                        max_num = float(max_val)
+                        return (df[column] >= min_num) & (df[column] <= max_num)
+                    except:
+                        # 如果转换失败，回退到字符串比较
+                        return (df[column].astype(str) >= min_val) & (df[column].astype(str) <= max_val)
+            except:
+                return pd.Series([False] * len(df))
+                
         # 默认返回全False
         return pd.Series([False] * len(df))
 
@@ -1026,7 +1356,7 @@ class ExcelMatchWindow(FluentWindow):
                     title="合并错误",
                     content=f"合并工作表 '{sheet_name}' 时出错: {str(e)}",
                     parent=self,
-                    position=InfoBarPosition.TOP,
+                    position=InfoBarPosition.TOP_RIGHT,
                     duration=3000
                 )
         
@@ -1119,12 +1449,17 @@ class ExcelMatchWindow(FluentWindow):
         # 创建一个全True的掩码，初始选中所有行
         mask = pd.Series([True] * len(merged_df))
         
+        print(f"开始最终过滤 - 合并后数据行数: {len(merged_df)}, 查询字段数量: {len(all_query_fields)}")
+        print(f"合并后可用列: {', '.join(merged_df.columns.tolist())}")
+        
         # 遍历每个查询字段并应用条件
         for field in all_query_fields:
-            if len(field) >= 3 and field[2].text().strip():
-                full_column = field[0].currentText()
-                operator = field[1].currentText()
-                value = field[2].text().strip()
+            if isinstance(field, dict) and 'valueEdit' in field and field['valueEdit'].text().strip():
+                full_column = field['comboBox'].currentText()
+                operator = field['operatorCombo'].currentText()
+                value = field['valueEdit'].text().strip()
+                
+                print(f"处理查询条件: {full_column} {operator} {value}")
                 
                 # 处理带工作表前缀的列名
                 if '.' in full_column:
@@ -1137,7 +1472,9 @@ class ExcelMatchWindow(FluentWindow):
                         target_column = full_column
                     else:
                         # 列不存在，添加错误信息
-                        error_messages.append(f"列 '{full_column}' 在合并数据中不存在")
+                        error_msg = f"列 '{full_column}' 在合并数据中不存在"
+                        print(f"错误: {error_msg}")
+                        error_messages.append(error_msg)
                         continue
                 else:
                     # 直接使用列名
@@ -1145,18 +1482,27 @@ class ExcelMatchWindow(FluentWindow):
                         target_column = full_column
                     else:
                         # 列不存在，添加错误信息
-                        error_messages.append(f"列 '{full_column}' 在合并数据中不存在")
+                        error_msg = f"列 '{full_column}' 在合并数据中不存在"
+                        print(f"错误: {error_msg}")
+                        error_messages.append(error_msg)
                         continue
+                
+                print(f"使用目标列: {target_column}")
                 
                 # 应用单个条件
                 condition_mask = self._applySingleCondition(merged_df, target_column, operator, value)
+                matching_count = condition_mask.sum() if isinstance(condition_mask, pd.Series) else 0
+                print(f"条件匹配结果: {matching_count} 行数据")
                 
                 # 如果条件无匹配数据，添加错误信息
                 if not condition_mask.any():
-                    error_messages.append(f"条件 '{target_column} {operator} {value}' 在合并数据中没有匹配记录")
+                    error_msg = f"条件 '{target_column} {operator} {value}' 在合并数据中没有匹配记录"
+                    print(f"错误: {error_msg}")
+                    error_messages.append(error_msg)
                 
                 # 结合当前条件掩码
                 mask = mask & condition_mask
+                print(f"当前累计条件后匹配行数: {mask.sum()}")
         
         # 如果有错误信息，显示并返回空DataFrame
         if error_messages:
@@ -1165,47 +1511,62 @@ class ExcelMatchWindow(FluentWindow):
                 message += f"{idx}. {err}\n"
             message += "\n请检查查询条件是否与合并数据兼容。"
             
+            print(f"最终过滤出错: {message}")
             MessageBox("查询结果", message, self).exec()
             return pd.DataFrame()
         
         # 返回经过筛选的数据
-        return merged_df[mask]
+        filtered_df = merged_df[mask]
+        print(f"最终过滤结果: {len(filtered_df)} 行数据")
+        return filtered_df
             
     def _getAllQueryFields(self):
         """获取所有查询字段"""
-        return [field for field in self.query_fields if len(field) >= 3 and field[2].text().strip()]
+        valid_fields = []
+        for field in self.query_fields:
+            if isinstance(field, dict) and 'valueEdit' in field and field['valueEdit'].text().strip():
+                valid_fields.append(field)
+        return valid_fields
 
     def _getSheetSpecificQueryFields(self, sheet_name):
         """获取特定工作表的查询字段"""
         sheet_query_fields = []
         
         for field in self.query_fields:
-            if len(field) >= 3:
-                column_full = field[0].currentText()
+            if isinstance(field, dict) and 'comboBox' in field and 'valueEdit' in field and field['valueEdit'].text().strip():
+                column_full = field['comboBox'].currentText()
                 
                 # 检查列名是否属于特定工作表
                 if "." in column_full:
                     field_sheet, field_col = column_full.split(".", 1)
                     if field_sheet == sheet_name:
-                        # 创建一个新的查询字段元组，但将列名修改为不带工作表前缀的版本
-                        new_field = list(field)
-                        # 创建一个临时ComboBox来替换原始的列选择框
-                        temp_combo = ComboBox()
-                        temp_combo.addItem(field_col)
-                        temp_combo.setCurrentIndex(0)
-                        new_field[0] = temp_combo
-                        sheet_query_fields.append(tuple(new_field))
+                        # 复制字段并修改列名
+                        new_field = {
+                            'comboBox': ComboBox(),
+                            'operatorCombo': field['operatorCombo'],
+                            'valueEdit': field['valueEdit'],
+                            'widget': field['widget']
+                        }
+                        
+                        # 设置列名为不带工作表前缀的列名
+                        new_field['comboBox'].addItem(field_col)
+                        new_field['comboBox'].setCurrentIndex(0)
+                        
+                        if 'logicCombo' in field:
+                            new_field['logicCombo'] = field['logicCombo']
+                            
+                        sheet_query_fields.append(new_field)
                 else:
                     # 如果列名不包含"."，则假定它是一个共同列，可以直接使用
                     sheet_query_fields.append(field)
-            else:
-                # 处理旧格式的查询字段
-                sheet_query_fields.append(field)
         
         return sheet_query_fields
         
     def _addQueryField(self):
         """添加查询字段"""
+        # 清空结果计数标签
+        self.resultCountLabel.setText("")
+        
         if not self.sheets or not self.selected_sheets:
             return
         
@@ -1231,52 +1592,128 @@ class ExcelMatchWindow(FluentWindow):
         logicCombo = None
         if self.query_fields:
             logicCombo = ComboBox()
-            logicCombo.addItems(["且", "或", "非"])
+            logicCombo.addItems(["且", "或"])
             logicCombo.setCurrentIndex(0)  # 默认选择"且"
-            logicCombo.setFixedWidth(70)  # 增加宽度，从50改为70
+            logicCombo.setFixedWidth(70)
             layout.addWidget(logicCombo)
         
         # 列选择下拉框
         comboBox = ComboBox()
         comboBox.addItems(columns)
-        comboBox.setMinimumWidth(150)  # 增加最小宽度以适应带工作表名的更长列名
+        comboBox.setMinimumWidth(150)
         # 默认选择第一个字段
         if columns:
             comboBox.setCurrentIndex(0)
         
-        # 比较操作符下拉框
+        # 操作符下拉框（初始为空，将根据列类型动态填充）
         operatorCombo = ComboBox()
-        operatorCombo.addItems(["包含", "不包含", "等于", "不等于", "大于", "小于", "大于等于", "小于等于", "介于"])
-        operatorCombo.setCurrentIndex(0)  # 默认选择"包含"
-        operatorCombo.setMinimumWidth(100)  # 增加最小宽度以确保完整显示内容
-        
-        # 操作符变化时更新输入框提示文本
-        def updatePlaceholder(index):
-            op = operatorCombo.currentText()
-            if op == "介于":
-                valueEdit.setPlaceholderText("最小值,最大值")
-            elif op == "包含":
-                valueEdit.setPlaceholderText("包含文本")
-            elif op == "不包含":
-                valueEdit.setPlaceholderText("不包含文本")
-            else:
-                valueEdit.setPlaceholderText("输入值")
-        
-        operatorCombo.currentIndexChanged.connect(updatePlaceholder)
+        operatorCombo.setMinimumWidth(100)
         
         # 值输入框
         valueEdit = LineEdit()
-        valueEdit.setPlaceholderText("包含文本")
-        valueEdit.setMinimumWidth(150)  # 设置最小宽度
-        valueEdit.setMaximumWidth(300)  # 设置最大宽度，防止输入框过长
+        valueEdit.setMinimumWidth(150)
+        valueEdit.setMaximumWidth(300)
         valueEdit.setClearButtonEnabled(True)
         
-        # 添加文本改变事件，根据内容自动调整宽度（在最大宽度范围内）
+        # 根据列类型更新运算符和占位符
+        def updateOperators():
+            selected_column = comboBox.currentText()
+            column_name = selected_column
+            sheet_name = None
+            
+            # 处理带工作表名前缀的列
+            if "." in selected_column:
+                sheet_name, column_name = selected_column.split(".", 1)
+            
+            # 获取列数据
+            if sheet_name and sheet_name in self.sheets:
+                df = self.sheets[sheet_name]
+            elif not sheet_name and self.selected_sheets and self.selected_sheets[0].isChecked():
+                # 如果没有工作表前缀，使用第一个选中的工作表
+                sheet_name = self.selected_sheets[0].text()
+                df = self.sheets[sheet_name] if sheet_name in self.sheets else None
+            else:
+                df = None
+            
+            # 默认操作符（用于文本）
+            operators = ["包含", "不包含"]
+            placeholder = "包含文本"
+            
+            # 检测列类型
+            if df is not None and column_name in df.columns:
+                col_data = df[column_name]
+                
+                # 检查是否是数值列
+                if pd.api.types.is_numeric_dtype(col_data):
+                    operators = ["等于", "大于", "小于", "介于"]
+                    placeholder = "输入数值"
+                # 检查是否是日期列
+                elif pd.api.types.is_datetime64_any_dtype(col_data) or col_data.apply(lambda x: isinstance(x, pd.Timestamp)).any():
+                    operators = ["等于", "大于", "小于", "介于"]
+                    placeholder = "输入日期 (YYYY-MM-DD)"
+            
+            # 更新操作符下拉框
+            operatorCombo.clear()
+            operatorCombo.addItems(operators)
+            operatorCombo.setCurrentIndex(0)
+            
+            # 更新占位符
+            valueEdit.setPlaceholderText(placeholder)
+        
+        # 连接列选择变化到操作符更新
+        comboBox.currentIndexChanged.connect(updateOperators)
+        
+        # 操作符变化时更新输入框提示文本
+        def updatePlaceholder():
+            op = operatorCombo.currentText()
+            # 针对特定操作符设置特殊的占位符
+            if op == "介于":
+                valueEdit.setPlaceholderText("最小值,最大值")
+                return
+            elif op == "包含":
+                valueEdit.setPlaceholderText("包含文本")
+                return
+            elif op == "不包含":
+                valueEdit.setPlaceholderText("不包含文本")
+                return
+                
+            # 对于其它操作符（等于、大于、小于等），根据列类型设置合适的占位符
+            selected_column = comboBox.currentText()
+            column_name = selected_column
+            
+            # 处理带工作表名前缀的列
+            if "." in selected_column:
+                sheet_name, column_name = selected_column.split(".", 1)
+                df = self.sheets.get(sheet_name)
+            elif self.selected_sheets and self.selected_sheets[0].isChecked():
+                # 使用第一个选中的工作表
+                sheet_name = self.selected_sheets[0].text()
+                df = self.sheets.get(sheet_name)
+            else:
+                df = None
+            
+            # 设置默认占位符
+            placeholder = "输入值"
+            
+            # 检测列类型并设置相应的占位符
+            if df is not None and column_name in df.columns:
+                col_data = df[column_name]
+                if pd.api.types.is_numeric_dtype(col_data):
+                    placeholder = "输入数值"
+                elif pd.api.types.is_datetime64_any_dtype(col_data) or col_data.apply(lambda x: isinstance(x, pd.Timestamp)).any():
+                    placeholder = "输入日期 (YYYY-MM-DD)"
+            
+            valueEdit.setPlaceholderText(placeholder)
+        
+        operatorCombo.currentIndexChanged.connect(updatePlaceholder)
+        
+        # 初始化操作符
+        updateOperators()
+        
+        # 添加文本改变事件，根据内容自动调整宽度
         def adjustWidth():
             text = valueEdit.text()
-            # 计算文本大概宽度 (每个字符约10像素)
             textWidth = len(text) * 10
-            # 设置宽度，最小150，最大300，根据内容自动调整
             valueEdit.setMinimumWidth(min(max(150, textWidth + 30), 300))
         
         valueEdit.textChanged.connect(adjustWidth)
@@ -1296,11 +1733,20 @@ class ExcelMatchWindow(FluentWindow):
         # 将字段组件添加到查询字段容器
         self.queryFieldsLayout.addWidget(fieldWidget)
         
-        # 保存查询字段信息，现在包括列选择、操作符和值输入框，以及可选的逻辑选择器
+        # 保存查询字段信息
+        field_data = {
+            'comboBox': comboBox,
+            'operatorCombo': operatorCombo,
+            'valueEdit': valueEdit,
+            'updateOperators': updateOperators,  # 保存更新运算符的函数引用
+            'widget': fieldWidget
+        }
+        
+        # 有条件地添加可选组件
         if logicCombo:
-            self.query_fields.append((comboBox, operatorCombo, valueEdit, logicCombo))
-        else:
-            self.query_fields.append((comboBox, operatorCombo, valueEdit, None))
+            field_data['logicCombo'] = logicCombo
+        
+        self.query_fields.append(field_data)
         
         # 更新执行按钮状态
         self._updateExecuteButtonState()
@@ -1487,7 +1933,7 @@ class ExcelMatchWindow(FluentWindow):
                 "未找到匹配记录，请检查查询条件。", 
                 self
             ).exec()
-            self.clearResultTable()
+            self._clearResultTable()
             return
         
         # 过滤掉全为空值的行（所有列都是NA/NaN/None的行）
@@ -1500,7 +1946,7 @@ class ExcelMatchWindow(FluentWindow):
                 title="数据清理",
                 content=f"已过滤 {filtered_count} 行全空数据",
                 parent=self,
-                position=InfoBarPosition.TOP,
+                position=InfoBarPosition.TOP_RIGHT,
                 duration=3000
             )
             
@@ -1511,7 +1957,7 @@ class ExcelMatchWindow(FluentWindow):
                 "过滤空值后无匹配记录，请检查查询条件。", 
                 self
             ).exec()
-            self.clearResultTable()
+            self._clearResultTable()
             return
             
         # 提取显示列
@@ -1566,7 +2012,7 @@ class ExcelMatchWindow(FluentWindow):
                 "处理后无可显示的数据，请检查查询条件和显示字段设置。", 
                 self
             ).exec()
-            self.clearResultTable()
+            self._clearResultTable()
             return
             
         # 显示最终结果
@@ -1589,441 +2035,76 @@ class ExcelMatchWindow(FluentWindow):
         
         return list(common_columns)
 
-    def clearResultTable(self):
+    def _clearResultTable(self):
         """清空结果表格"""
         self.resultTable.clear()
         self.resultTable.setRowCount(0)
         self.resultTable.setColumnCount(0)
         self.result_data = None
+        # 清空结果计数标签
+        self.resultCountLabel.setText("")
 
     def _applyQueryConditions(self, df, query_fields):
-        """应用查询条件到数据框，使用更高效的pandas查询语法，并检测逻辑矛盾"""
-        # 如果没有查询条件，则返回原数据
-        if not query_fields:
+        """应用所有查询条件，支持简单的且/或逻辑"""
+        if not query_fields or df.empty:
             return df
             
-        # 收集所有错误信息
-        error_messages = []
+        # 最终的条件掩码
+        final_mask = pd.Series([True] * len(df))
+        # 当前的逻辑运算符
+        current_logic = "且"
+        
+        print(f"开始应用查询条件 - 数据行数: {len(df)}, 查询字段数量: {len(query_fields)}")
+        
+        for i, field in enumerate(query_fields):
+            # 获取字段信息
+            column = field['comboBox'].currentText()
+            operator = field['operatorCombo'].currentText()
+            value = field['valueEdit'].text().strip()
             
-        # 获取有效的查询条件 (有值的查询字段)
-        active_query_fields = []
-        for field in query_fields:
-            # 检查字段元组的长度，适配新旧格式
-            if len(field) >= 3 and field[2].text().strip():
-                # 新格式: (列选择框, 操作符选择框, 值输入框, 逻辑选择框)
-                column = field[0].currentText()
-                operator = field[1].currentText() if len(field) > 1 else "包含"
-                value = field[2].text().strip()
-                logic = field[3].currentText() if len(field) > 3 and field[3] is not None else "且"
-                active_query_fields.append((column, operator, value, logic))
-            elif len(field) == 2 and field[1].text().strip():
-                # 旧格式: (列选择框, 值输入框)
-                column = field[0].currentText()
-                value = field[1].text().strip()
-                active_query_fields.append((column, "包含", value, "且"))
-                
-        # 如果没有有效的查询条件，则返回原数据
-        if not active_query_fields:
-            return df
+            print(f"应用条件 {i+1}: {column} {operator} {value}")
             
-        # 构建布尔索引而不是使用series的累积操作
-        all_masks = []  # 存储所有条件的掩码
-        all_logics = []  # 存储所有逻辑操作符
-        all_conditions = []  # 存储所有条件的描述，用于矛盾检测
-
-        # 预处理数据框 - 对日期列进行一次性转换
-        date_columns = {}  # 存储已转换的日期列
-        
-        # 检测逻辑矛盾
-        conflict_columns = {}  # 按列存储可能冲突的条件
-        
-        # 常用日期格式列表，用于尝试解析日期
-        date_formats = [
-            '%Y-%m-%d', '%d/%m/%Y', '%m/%d/%Y', 
-            '%Y/%m/%d', '%Y-%m-%d %H:%M:%S',
-            '%d-%m-%Y', '%m-%d-%Y'
-        ]
-        
-        # 禁用pandas日期解析警告
-        import warnings
-        warnings.filterwarnings("ignore", category=UserWarning, module="pandas.core.tools.datetimes")
-        
-        # 处理每个查询条件
-        for i, (column, operator, value, logic) in enumerate(active_query_fields):
-            # 第一个条件不需要记录逻辑
-            if i > 0:
-                all_logics.append(logic)
-                
-            if column not in df.columns:
-                error_messages.append(f"查询字段中的列 '{column}' 在工作表中不存在")
+            # 如果值为空，跳过此条件
+            if not value:
+                print(f"条件 {i+1}: 值为空，跳过")
                 continue
             
-            # 记录条件
-            condition_info = {"column": column, "operator": operator, "value": value}
-            all_conditions.append(condition_info)
+            # 获取条件掩码
+            condition_mask = self._applySingleCondition(df, column, operator, value)
+            matching_count = condition_mask.sum() if isinstance(condition_mask, pd.Series) else 0
+            print(f"条件 {i+1} 匹配行数: {matching_count}")
             
-            # 如果列已有条件，添加进冲突检测字典
-            if column not in conflict_columns:
-                conflict_columns[column] = []
-            conflict_columns[column].append(condition_info)
-                
-            # 创建当前条件的掩码
-            current_mask = None
+            # 更新最终掩码
+            if i == 0:  # 第一个条件
+                final_mask = condition_mask
+                print(f"设置初始掩码，匹配行数: {final_mask.sum()}")
+            else:
+                # 应用逻辑运算
+                print(f"应用逻辑运算: {current_logic}")
+                if current_logic == "且":
+                    final_mask = final_mask & condition_mask
+                elif current_logic == "或":
+                    final_mask = final_mask | condition_mask
+                print(f"应用逻辑运算后匹配行数: {final_mask.sum()}")
             
-            try:
-                # 检测日期列并缓存转换结果
-                is_datetime_column = False
-                date_col = None
-                
-                # 检查是否已将此列识别为日期
-                if column in date_columns:
-                    is_datetime_column = True
-                    date_col = date_columns[column]
+            # 获取下一个条件的逻辑运算符（如果有）
+            if i < len(query_fields) - 1:
+                # 先尝试从当前字段获取
+                if 'logicCombo' in field and field['logicCombo'] is not None:
+                    current_logic = field['logicCombo'].currentText()
+                    print(f"下一条件的逻辑运算符(当前字段): {current_logic}")
+                # 然后尝试从下一个字段获取
+                elif 'logicCombo' in query_fields[i+1] and query_fields[i+1]['logicCombo'] is not None:
+                    current_logic = query_fields[i+1]['logicCombo'].currentText()
+                    print(f"下一条件的逻辑运算符(下一字段): {current_logic}")
                 else:
-                    # 尝试检测日期列
-                    try:
-                        if pd.api.types.is_datetime64_any_dtype(df[column].dtype):
-                            is_datetime_column = True
-                            date_col = df[column]
-                            date_columns[column] = date_col
-                        else:
-                            # 尝试转换第一个非空值来检测是否可能是日期字符串
-                            sample = df[column].dropna().iloc[0] if not df[column].dropna().empty else None
-                            if sample and isinstance(sample, str):
-                                try:
-                                    # 尝试使用常见日期格式进行解析，避免dateutil自动推断警告
-                                    for date_format in date_formats:
-                                        try:
-                                            date_col = pd.to_datetime(df[column], format=date_format, errors='coerce')
-                                            # 如果大部分值不是NaT，说明找到了正确的格式
-                                            if date_col.notna().sum() > 0.5 * len(date_col):
-                                                is_datetime_column = True
-                                                date_columns[column] = date_col
-                                                break
-                                        except:
-                                            continue
-                                            
-                                    # 如果所有尝试失败，最后尝试自动推断，但这里会静默处理警告
-                                    if not is_datetime_column:
-                                        with warnings.catch_warnings():
-                                            warnings.simplefilter("ignore")
-                                            date_col = pd.to_datetime(df[column], errors='coerce')
-                                            # 如果转换成功（不全是NaT），则视为日期列
-                                            if not date_col.isna().all() and date_col.notna().sum() > 0.5 * len(date_col):
-                                                is_datetime_column = True
-                                                date_columns[column] = date_col
-                                except:
-                                    pass
-                    except:
-                        pass
-                    
-                # 根据操作符和字段类型构建查询条件
-                if operator == "包含":
-                    if is_datetime_column:
-                        # 对日期列进行字符串包含查询
-                        str_col = df[column].astype(str)
-                        current_mask = str_col.str.contains(value, case=False, na=False)
-                    elif pd.api.types.is_numeric_dtype(df[column]):
-                        # 数值列转字符串后包含查询
-                        current_mask = df[column].astype(str).str.contains(value, case=False, na=False)
-                    else:
-                        # 字符串列直接包含查询
-                        current_mask = df[column].astype(str).str.contains(value, case=False, na=False)
-                
-                elif operator == "不包含":
-                    if is_datetime_column:
-                        str_col = df[column].astype(str)
-                        current_mask = ~str_col.str.contains(value, case=False, na=False)
-                    elif pd.api.types.is_numeric_dtype(df[column]):
-                        current_mask = ~df[column].astype(str).str.contains(value, case=False, na=False)
-                    else:
-                        current_mask = ~df[column].astype(str).str.contains(value, case=False, na=False)
-                
-                elif operator == "等于":
-                    if is_datetime_column:
-                        try:
-                            # 尝试使用已知的日期格式解析查询值
-                            query_date = None
-                            for date_format in date_formats:
-                                try:
-                                    query_date = pd.to_datetime(value, format=date_format)
-                                    break
-                                except:
-                                    continue
-                                    
-                            # 如果格式化失败，尝试自动推断
-                            if query_date is None:
-                                query_date = pd.to_datetime(value)
-                                
-                            current_mask = date_col.dt.date == query_date.date()
-                        except:
-                            current_mask = df[column].astype(str) == value
-                    elif pd.api.types.is_numeric_dtype(df[column]):
-                        try:
-                            current_mask = df[column] == float(value)
-                        except ValueError:
-                            current_mask = df[column].astype(str) == value
-                    else:
-                        current_mask = df[column].astype(str) == value
-                
-                elif operator == "不等于":
-                    if is_datetime_column:
-                        try:
-                            # 尝试使用已知的日期格式解析查询值
-                            query_date = None
-                            for date_format in date_formats:
-                                try:
-                                    query_date = pd.to_datetime(value, format=date_format)
-                                    break
-                                except:
-                                    continue
-                                    
-                            # 如果格式化失败，尝试自动推断
-                            if query_date is None:
-                                query_date = pd.to_datetime(value)
-                                
-                            current_mask = date_col.dt.date != query_date.date()
-                        except:
-                            current_mask = df[column].astype(str) != value
-                    elif pd.api.types.is_numeric_dtype(df[column]):
-                        try:
-                            current_mask = df[column] != float(value)
-                        except ValueError:
-                            current_mask = df[column].astype(str) != value
-                    else:
-                        current_mask = df[column].astype(str) != value
-                
-                elif operator == "大于":
-                    if is_datetime_column:
-                        try:
-                            # 尝试使用已知的日期格式解析查询值
-                            query_date = None
-                            for date_format in date_formats:
-                                try:
-                                    query_date = pd.to_datetime(value, format=date_format)
-                                    break
-                                except:
-                                    continue
-                                    
-                            # 如果格式化失败，尝试自动推断
-                            if query_date is None:
-                                query_date = pd.to_datetime(value)
-                                
-                            current_mask = date_col > query_date
-                        except:
-                            current_mask = df[column].astype(str) > value
-                    else:
-                        try:
-                            current_mask = df[column] > float(value)
-                        except (ValueError, TypeError):
-                            current_mask = df[column].astype(str) > value
-                
-                elif operator == "小于":
-                    if is_datetime_column:
-                        try:
-                            # 尝试使用已知的日期格式解析查询值
-                            query_date = None
-                            for date_format in date_formats:
-                                try:
-                                    query_date = pd.to_datetime(value, format=date_format)
-                                    break
-                                except:
-                                    continue
-                                    
-                            # 如果格式化失败，尝试自动推断
-                            if query_date is None:
-                                query_date = pd.to_datetime(value)
-                                
-                            current_mask = date_col < query_date
-                        except:
-                            current_mask = df[column].astype(str) < value
-                    else:
-                        try:
-                            current_mask = df[column] < float(value)
-                        except (ValueError, TypeError):
-                            current_mask = df[column].astype(str) < value
-                
-                elif operator == "大于等于":
-                    if is_datetime_column:
-                        try:
-                            # 尝试使用已知的日期格式解析查询值
-                            query_date = None
-                            for date_format in date_formats:
-                                try:
-                                    query_date = pd.to_datetime(value, format=date_format)
-                                    break
-                                except:
-                                    continue
-                                    
-                            # 如果格式化失败，尝试自动推断
-                            if query_date is None:
-                                query_date = pd.to_datetime(value)
-                                
-                            current_mask = date_col >= query_date
-                        except:
-                            current_mask = df[column].astype(str) >= value
-                    else:
-                        try:
-                            current_mask = df[column] >= float(value)
-                        except (ValueError, TypeError):
-                            current_mask = df[column].astype(str) >= value
-                
-                elif operator == "小于等于":
-                    if is_datetime_column:
-                        try:
-                            # 尝试使用已知的日期格式解析查询值
-                            query_date = None
-                            for date_format in date_formats:
-                                try:
-                                    query_date = pd.to_datetime(value, format=date_format)
-                                    break
-                                except:
-                                    continue
-                                    
-                            # 如果格式化失败，尝试自动推断
-                            if query_date is None:
-                                query_date = pd.to_datetime(value)
-                                
-                            current_mask = date_col <= query_date
-                        except:
-                            current_mask = df[column].astype(str) <= value
-                    else:
-                        try:
-                            current_mask = df[column] <= float(value)
-                        except (ValueError, TypeError):
-                            current_mask = df[column].astype(str) <= value
-                            
-                elif operator == "介于":
-                    try:
-                        min_val, max_val = value.split(",", 1)
-                        min_val = min_val.strip()
-                        max_val = max_val.strip()
-                        
-                        if is_datetime_column:
-                            try:
-                                # 尝试使用已知的日期格式解析最小日期
-                                min_date = None
-                                for date_format in date_formats:
-                                    try:
-                                        min_date = pd.to_datetime(min_val, format=date_format)
-                                        break
-                                    except:
-                                        continue
-                                        
-                                # 如果格式化失败，尝试自动推断
-                                if min_date is None:
-                                    min_date = pd.to_datetime(min_val)
-                                    
-                                # 尝试使用已知的日期格式解析最大日期
-                                max_date = None
-                                for date_format in date_formats:
-                                    try:
-                                        max_date = pd.to_datetime(max_val, format=date_format)
-                                        break
-                                    except:
-                                        continue
-                                        
-                                # 如果格式化失败，尝试自动推断
-                                if max_date is None:
-                                    max_date = pd.to_datetime(max_val)
-                                    
-                                current_mask = (date_col >= min_date) & (date_col <= max_date)
-                            except:
-                                current_mask = (df[column].astype(str) >= min_val) & (df[column].astype(str) <= max_val)
-                        else:
-                            try:
-                                min_num = float(min_val)
-                                max_num = float(max_val)
-                                # 检查范围是否有效
-                                if min_num > max_num:
-                                    raise ValueError(f"列 '{column}' 的范围无效: {min_num} 大于 {max_num}")
-                                current_mask = (df[column] >= min_num) & (df[column] <= max_num)
-                            except (ValueError, TypeError):
-                                current_mask = (df[column].astype(str) >= min_val) & (df[column].astype(str) <= max_val)
-                    except ValueError as e:
-                        if "范围无效" in str(e):
-                            raise
-                        current_mask = df[column].astype(str) == value
-                
-                # 将当前掩码添加到列表中
-                all_masks.append(current_mask)
-                
-                # 检查单个条件是否满足
-                if not current_mask.any():
-                    error_messages.append(f"条件 '{column} {operator} {value}' 没有匹配的数据")
-                
-                # 如果不是第一个条件，检查组合结果
-                if i > 0:
-                    # 计算到当前条件为止的组合结果
-                    temp_mask = all_masks[0]
-                    for j in range(len(all_logics)):
-                        if j < i:  # 计算到当前条件
-                            if all_logics[j] == "且":
-                                temp_mask = temp_mask & all_masks[j+1]
-                            elif all_logics[j] == "或":
-                                temp_mask = temp_mask | all_masks[j+1]
-                            elif all_logics[j] == "非":
-                                temp_mask = temp_mask & (~all_masks[j+1])
-                    
-                    # 检查组合结果是否为空
-                    if not temp_mask.any():
-                        error_messages.append(f"条件 '{column} {operator} {value}' 与前面的条件组合后没有匹配数据")
-                    
-            except Exception as e:
-                # 记录任何其他异常
-                error_messages.append(f"应用条件 '{column} {operator} {value}' 时出错: {str(e)}")
+                    current_logic = "且"  # 默认使用"且"
+                    print(f"未找到逻辑运算符，使用默认值: {current_logic}")
         
-        # 在应用所有条件前，检查是否有错误信息
-        if error_messages:
-            # 构建清晰的错误消息
-            message = "查询条件错误:\n\n"
-            for idx, err in enumerate(error_messages, 1):
-                message += f"{idx}. {err}\n"
-            message += "\n请检查查询条件。"
-            
-            # 显示消息并返回空结果
-            MessageBox("查询结果", message, self).exec()
-            return df.iloc[0:0]  # 返回空DataFrame
-            
-        # 检查是否有逻辑矛盾
-        contradictions = self._checkLogicalContradictions(conflict_columns)
-        if contradictions:
-            message = "查询条件存在逻辑矛盾:\n\n"
-            for idx, contra in enumerate(contradictions, 1):
-                message += f"{idx}. {contra}\n"
-            message += "\n请修改条件。"
-            
-            MessageBox("条件矛盾", message, self).exec()
-            return df.iloc[0:0]  # 返回空DataFrame
-        
-        # 合并所有条件
-        if not all_masks:
-            return df
-            
-        # 从第一个条件开始
-        result_mask = all_masks[0]
-        
-        # 根据逻辑运算符合并后续条件
-        for i in range(len(all_logics)):
-            logic = all_logics[i]
-            mask = all_masks[i+1]
-            
-            if logic == "且":
-                result_mask = result_mask & mask
-            elif logic == "或":
-                result_mask = result_mask | mask
-            elif logic == "非":
-                result_mask = result_mask & (~mask)
-        
-        # 应用最终的条件掩码
-        final_result = df[result_mask]
-        
-        # 再次确认结果不为空
-        if final_result.empty:
-            MessageBox("查询结果", "没有满足所有查询条件的数据。\n请检查查询条件或选择其他工作表。", self).exec()
-            return df.iloc[0:0]  # 返回空DataFrame
-            
-        return final_result
+        # 应用掩码筛选数据
+        filtered_df = df[final_mask]
+        print(f"最终过滤结果: {len(filtered_df)} 行数据")
+        return filtered_df
 
     def _checkLogicalContradictions(self, conflict_columns):
         """检查查询条件中的逻辑矛盾，返回矛盾列表"""
@@ -2180,7 +2261,7 @@ class ExcelMatchWindow(FluentWindow):
 
         # 清空之前的查询和匹配字段
         self._clearAllFields()
-        self.clearResultTable()
+        self._clearResultTable()
 
         # 启用添加字段按钮 if columns exist
         has_columns = bool(self.columns)
@@ -2225,6 +2306,9 @@ class ExcelMatchWindow(FluentWindow):
 
     def _addMatchField(self):
         """添加显示字段"""
+        # 清空结果计数标签
+        self.resultCountLabel.setText("")
+        
         if not self.sheets or not self.selected_sheets:
             return
             
@@ -2286,21 +2370,18 @@ class ExcelMatchWindow(FluentWindow):
         
         # 更新添加字段按钮状态
         if has_selected_sheets:
-            # 合并模式下，即使没有共同列也可以添加查询和显示字段
-            if processing_mode == "合并":
-                self.addQueryButton.setEnabled(True)
-                self.addMatchButton.setEnabled(True)
-            else:
-                # 堆叠模式下，需要检查是否有共同列
-                has_common_columns = bool(self._getCommonColumns())
-                self.addQueryButton.setEnabled(has_common_columns)
-                self.addMatchButton.setEnabled(has_common_columns)
+            # 只要有选中的工作表，就启用添加查询和显示字段按钮
+            self.addQueryButton.setEnabled(True)
+            self.addMatchButton.setEnabled(True)
         else:
             self.addQueryButton.setEnabled(False)
             self.addMatchButton.setEnabled(False)
 
     def _removeMatchField(self, widget):
         """移除显示字段"""
+        # 清空结果计数标签
+        self.resultCountLabel.setText("")
+        
         # 查找组件在列表中的索引
         found_index = -1
         for i, (combo, _) in enumerate(self.match_fields):
@@ -2335,35 +2416,31 @@ class ExcelMatchWindow(FluentWindow):
         self.queryFieldsContainer.updateGeometry()
         self.queryFieldsContainer.update()
     
-    def _removeQueryField(self, widget):
+    def _removeQueryField(self, fieldWidget):
         """移除查询字段"""
-        # 查找组件在列表中的索引
-        found_index = -1
-        for i, field_tuple in enumerate(self.query_fields):
-            # 字段元组现在可能是(列选择框, 操作符选择框, 值输入框, 逻辑选择框)
-            if len(field_tuple) >= 3 and field_tuple[0].parentWidget() == widget:
-                found_index = i
+        # 找到字段对应的索引
+        index_to_remove = -1
+        for i, field in enumerate(self.query_fields):
+            # 检查字段的comboBox组件的父级是否为需要删除的widget
+            if isinstance(field, dict) and 'comboBox' in field and field['comboBox'].parentWidget() == fieldWidget:
+                index_to_remove = i
                 break
-                
-        if found_index != -1:
-            # 从列表中移除
-            self.query_fields.pop(found_index)
+        
+        # 如果找到字段，则删除它
+        if index_to_remove >= 0:
+            # 从列表中移除字段
+            self.query_fields.pop(index_to_remove)
             
-            # 从布局中移除并删除组件
-            widget.deleteLater()
-            
-            # 如果删除后只剩一个查询字段，需要移除其逻辑选择器（因为只有一个条件不需要逻辑选择器）
-            if len(self.query_fields) == 1 and len(self.query_fields[0]) == 4 and self.query_fields[0][3] is not None:
-                # 将第一个字段的逻辑选择器设为None
-                col_combo, op_combo, value_edit, _ = self.query_fields[0]
-                self.query_fields[0] = (col_combo, op_combo, value_edit, None)
-            
-            # 立即更新布局
-            self._reflowQueryFieldsLayout()
+            # 从布局中移除组件并删除
+            fieldWidget.deleteLater()
             
             # 更新执行按钮状态
             self._updateExecuteButtonState()
             
+            # 如果删除了最后一个字段，清空结果表格
+            if not self.query_fields:
+                self._clearResultTable()
+    
     def _getCommonColumns(self):
         """获取所有选择的工作表中的共同列，保持第一个工作表中列的原始顺序"""
         if not self.selected_sheets:
@@ -2406,31 +2483,47 @@ class ExcelMatchWindow(FluentWindow):
 
     def _onProcessingModeChanged(self, index):
         """处理模式变化时的处理"""
+        # 清空结果计数标签
+        self.resultCountLabel.setText("")
+        
         # 获取当前模式
         current_mode = self.processingModeCombo.currentText()
         
-        # 清空现有的查询和显示字段
-        self._clearAllFields()
+        # 暂时断开信号连接，防止在更新过程中触发事件循环
+        self.processingModeCombo.blockSignals(True)
         
-        # 如果已经加载了Excel文件，则重新添加查询和显示字段
-        if self.sheets and len(self.selected_sheets) > 0:
-            # 添加一个新的查询字段
-            self._addQueryField()
-            
-            # 添加一个新的显示字段
-            self._addMatchField()
-            
-            # 更新执行按钮状态
-            self._updateExecuteButtonState()
-            
-            # 显示模式变化提示
-            InfoBar.info(
-                title="模式变化",
-                content=f"已切换到{current_mode}模式，查询和显示字段已更新",
-                parent=self,
-                position=InfoBarPosition.TOP,
-                duration=3000
-            )
+        try:
+            # 如果已经加载了Excel文件并且有工作表
+            if self.sheets and len(self.selected_sheets) > 0:
+                # 清空现有的查询和显示字段
+                self._clearAllFields()
+                
+                # 添加一个新的查询字段
+                self._addQueryField()
+                
+                # 添加一个新的显示字段
+                self._addMatchField()
+                
+                # 更新执行按钮状态
+                self._updateExecuteButtonState()
+                
+                # 显示简化的模式变化提示
+                InfoBar.info(
+                    title="模式变化",
+                    content=f"已切换到{current_mode}模式",
+                    parent=self,
+                    position=InfoBarPosition.TOP_RIGHT,  # 改为右上角显示，避免与其他通知重叠
+                    duration=2000
+                )
+            else:
+                # 更新所有现有查询字段的下拉选项
+                self._updateAllQueryFieldsOptions()
+                
+                # 更新所有现有显示字段的下拉选项
+                self._updateAllMatchFieldsOptions()
+        finally:
+            # 恢复信号连接
+            self.processingModeCombo.blockSignals(False)
 
     def onResize(self, event):
         """窗口大小变化时的处理"""
@@ -2589,14 +2682,111 @@ class ExcelMatchWindow(FluentWindow):
 
                 self.resultTable.setItem(row_idx, col_idx, table_item)
 
-        # 显示结果统计
-        InfoBar.success(
-            title="查询完成",
-            content=f"共找到 {row_count} 条匹配记录",
-            parent=self,
-            position=InfoBarPosition.TOP,
-            duration=3000
-        )
+        # 更新结果计数标签而不是显示InfoBar
+        self.resultCountLabel.setText(f"共找到 {row_count} 条匹配记录")
+
+    def _autoDetectAndSetProcessingMode(self, sheet_names):
+        """自动检测表结构并选择合适的处理模式"""
+        if len(sheet_names) <= 1:
+            # 只有一个工作表时，默认使用堆叠模式
+            self.processingModeCombo.setCurrentText("堆叠")
+            return
+        
+        # 检查是否有共同列
+        common_columns = self._getCommonColumns()
+        
+        # 检查各表结构相似度
+        structure_similarity = self._calculateStructureSimilarity(sheet_names)
+        
+        # 如果有足够的共同列且结构相似度低，推荐使用合并模式
+        if common_columns and len(common_columns) >= 1 and structure_similarity < 0.7:
+            recommended_mode = "合并"
+            reason = f"检测到{len(common_columns)}个共同列，表结构差异较大"
+        else:
+            recommended_mode = "堆叠"
+            reason = "表结构相似度高，适合堆叠处理" if structure_similarity >= 0.7 else "未检测到足够的共同列"
+        
+        # 设置推荐的处理模式
+        self.processingModeCombo.setCurrentText(recommended_mode)
+        
+        # 显示模式选择信息（简化为单一InfoBar）
+        # mode_info = {
+        #     "堆叠": "将不同工作表的数据按行组合在一起",
+        #     "合并": "根据共同字段横向关联不同工作表的数据"
+        # }
+        # InfoBar.info(
+        #     title="模式选择",
+        #     content=f"已自动选择{recommended_mode}模式（{reason}）\n{mode_info[recommended_mode]}",
+        #     parent=self,
+        #     position=InfoBarPosition.TOP,
+        #     duration=4000
+        # )
+
+    def _calculateStructureSimilarity(self, sheet_names):
+        """计算各工作表结构的相似度，返回0-1之间的值，1表示完全相同"""
+        if len(sheet_names) <= 1:
+            return 1.0
+        
+        # 收集所有工作表的列集合
+        column_sets = []
+        for sheet_name in sheet_names:
+            if sheet_name in self.sheets:
+                column_sets.append(set(self.sheets[sheet_name].columns))
+        
+        if not column_sets:
+            return 0.0
+        
+        # 计算两两之间的相似度（Jaccard相似系数）
+        similarities = []
+        for i in range(len(column_sets)):
+            for j in range(i+1, len(column_sets)):
+                set1 = column_sets[i]
+                set2 = column_sets[j]
+                if not set1 or not set2:
+                    continue
+                
+                # 计算Jaccard相似系数：交集大小除以并集大小
+                intersection = len(set1.intersection(set2))
+                union = len(set1.union(set2))
+                
+                if union > 0:
+                    similarity = intersection / union
+                    similarities.append(similarity)
+        
+        # 返回平均相似度
+        return sum(similarities) / len(similarities) if similarities else 0.0
+
+    def _continueQueryExecution(self, flyout, processing_mode, selected_sheet_names):
+        """用户确认继续执行查询"""
+        # 关闭提示
+        flyout.close()
+        
+        # 继续执行查询
+        try:
+            # 执行对应模式的查询
+            if processing_mode == "堆叠":
+                # 垂直堆叠模式 - 适用于工作表有相似结构的情况
+                self._executeStackMode(selected_sheet_names)
+            elif processing_mode == "合并" and len(selected_sheet_names) >= 2:
+                # 合并模式 - 适用于不同工作表之间有关联关系的情况
+                self._executeMergeMode(selected_sheet_names)
+            else:
+                # 如果是合并模式但只选择了一个工作表，自动切换为堆叠模式
+                if processing_mode == "合并" and len(selected_sheet_names) == 1:
+                    # 使用更精简的通知
+                    InfoBar.info(
+                        title="模式调整",
+                        content="合并模式需要至少两个工作表，已自动使用堆叠模式",
+                        parent=self,
+                        position=InfoBarPosition.TOP,
+                        duration=3000
+                    )
+                # 执行堆叠模式
+                self._executeStackMode(selected_sheet_names)
+                
+        except Exception as e:
+            MessageBox("查询错误", f"执行查询时发生错误: {str(e)}", self).exec()
+            self._clearResultTable()
 
 
 def main():
